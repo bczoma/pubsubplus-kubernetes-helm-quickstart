@@ -14,6 +14,7 @@ Contents:
     + [Deployment scaling](#deployment-scaling)
       - [Simplified vertical scaling](#simplified-vertical-scaling)
       - [Comprehensive vertical scaling](#comprehensive-vertical-scaling)
+      - [Enabling a Disruption Budget for HA deployment](#enabling-a-disruption-budget-for-ha-deployment)
       - [Reducing resource requirements of Monitoring Nodes in an HA deployment](#reducing-resource-requirements-of-monitoring-nodes-in-an-ha-deployment)
     + [Disk Storage](#disk-storage)
       - [Allocating smaller storage to Monitor pods in an HA deployment](#allocating-smaller-storage-to-monitor-pods-in-an-ha-deployment)
@@ -21,6 +22,7 @@ Contents:
       - [Creating a new storage class](#creating-a-new-storage-class)
       - [Using an existing PVC (Persistent Volume Claim)](#using-an-existing-pvc-persistent-volume-claim-)
       - [Using a pre-created provider-specific volume](#using-a-pre-created-provider-specific-volume)
+      - [Tested storage environments and providers](#tested-storage-environments-and-providers)
     + [Exposing the PubSub+ Event Broker Services](#exposing-the-pubsub-software-event-broker-services)
       - [Specifying Service Type](#specifying-service-type)
       - [Using Ingress to access event broker services](#using-ingress-to-access-event-broker-services)
@@ -40,6 +42,9 @@ Contents:
     + [Security considerations](#security-considerations)
       - [Using Security Context](#using-security-context)
       - [Enabling pod label "active" in a tight security environment](#enabling-pod-label-active-in-a-tight-security-environment)
+    + [User management considerations](#user-management-considerations)
+      - [Adding new users](#adding-new-users)
+      - [Changing user passwords](#changing-user-passwords)
   * [**Deployment Prerequisites**](#deployment-prerequisites)
     + [Platform and tools setup](#platform-and-tools-setup)
       - [Install the `kubectl` command-line tool](#install-the-kubectl-command-line-tool)
@@ -70,6 +75,7 @@ Contents:
       - [Modification example](#modification-example)
   * [**Re-installing a Deployment**](#re-installing-a-deployment)
   * [**Deleting a Deployment**](#deleting-a-deployment)
+  * [**Backing Up and Restore**](#backing-up-and-restore)
 
 
 
@@ -88,6 +94,10 @@ Multiple YAML templates define the PubSub+ Kubernetes deployment with several pa
 There are two deployment options described in this document:
 * The recommended option is to use the [Kubernetes Helm tool](https://github.com/helm/helm/blob/master/README.md), which can also manage your deployment's lifecycle, including upgrade and delete.
 * Another option is to generate a set of templates with customized values from the PubSub+ Helm chart and then use the Kubernetes native `kubectl` tool to deploy. The deployment will use the authorizations of the requesting user. However, in this case, Helm will not be able to manage your Kubernetes rollouts lifecycle.
+
+It is also important to know that Helm is a templating tool that helps package PubSub+ Software Event Broker deployment into charts.
+It is most useful when first setting up broker nodes on the Kubernetes cluster. It can handle the install-update-delete lifecycle for the broker nodes deployed to the cluster.
+It can not be used to scale-up, scale down or apply custom configuration to an already deployed PubSub+ Software Event Broker.
 
 The next sections will provide details on the PubSub+ Helm chart, dependencies and customization options, followed by [deployment prerequisites](#deployment-prerequisites) and the actual [deployment steps](#deployment-steps).
 
@@ -134,6 +144,17 @@ Additionally, CPU and memory must be sized and provided in `solace.systemScaling
 Note: beyond CPU and memory requirements, required storage size (see next section) also depends significantly on scaling. The calculator can be used to determine that as well.
 
 Also note, that specifying maxConnections, maxQueueMessages and maxSpoolUsage on initial deployment will overwrite the broker’s default values. On the other hand, doing the same using Helm upgrade on an existing deployment will not overwrite these values on brokers configuration, but it can be used to prepare (first step) for a manual scale up through CLI where these parameters can be actually changed (second step).
+
+#### Enabling a Disruption Budget for HA deployment
+
+One of the important parameters available to configure PubSub+ Software Event Broker HA is the [`podDisruptionBudget`](https://kubernetes.io/docs/tasks/run-application/configure-pdb/).
+This helps you control and limit the disruption to your application when its pods need to be rescheduled for upgrades, maintenance or any other reason.
+This is only available when we have the PubSub+ Software Event Broker deployed in [high-availability (HA) mode](//docs.solace.com/Overviews/SW-Broker-Redundancy-and-Fault-Tolerance.htm), that is, `solace.redundancy=true`.
+
+In an HA deployment with Primary, Backup and Monitor nodes, we require a minimum of 2 nodes to reach a quorum. The pod disruption budget defaults to a minimum of two nodes when enabled.
+
+To enable this functionality you have to set  `solace.podDisruptionBudgetForHA=true` and `solace.redundancy=true`.
+
 
 #### Reducing resource requirements of Monitoring Nodes in an HA deployment
 
@@ -259,6 +280,12 @@ Another example is using [hostPath](//kubernetes.io/docs/concepts/storage/volume
       # this field is optional
       type: Directory
 ```
+#### Tested storage environments and providers
+
+The PubSub+ Software Event Broker has been tested to work with the following, Portworx, Ceph, Cinder (Openstack), vSphere storage for Kubernetes as documented [here](https://docs.solace.com/Cloud/Deployment-Considerations/resource-requirements-k8s.htm#supported-storage-solutions).
+However, note that for [EKS](https://docs.solace.com/Cloud/Deployment-Considerations/installing-ps-cloud-k8s-eks-specific-req.htm) and [GKE](https://docs.solace.com/Cloud/Deployment-Considerations/installing-ps-cloud-k8s-gke-specific-req.htm#storage-class), `xfs` produced the best results during tests.
+[AKS](https://docs.solace.com/Cloud/Deployment-Considerations/installing-ps-cloud-k8s-aks-specific-req.htm) users can opt for `Local Redundant Storage (LRS)` redundancy. This is because they produce the best results
+when compared with the other types available on Azure.
 
 ### Exposing the PubSub+ Software Event Broker Services
 
@@ -478,7 +505,8 @@ helm install my-release solacecharts/pubsubplus \
 --set tls.enabled=true,tls.serverCertificatesSecret=<my-tls-secret>
 ```
 
-Important: it is not possible to update an existing deployment to enable TLS that has been created without TLS enabled, by a simply using the [modify deployment](#modifying-or-upgrading-a-deployment) procedure. In this case, for the first time, certificates need to be [manually loaded and set up](//docs.solace.com/Configuring-and-Managing/Managing-Server-Certs.htm) on each broker node. After that it is possible to use `helm upgrade` with a secret specified.
+Important: it is not possible to update an existing deployment to enable TLS that has been created without TLS enabled, by simply using the [modify deployment](#modifying-or-upgrading-a-deployment) procedure. In this case, for the first time, certificates need to be [manually loaded and set up](//docs.solace.com/Configuring-and-Managing/Managing-Server-Certs.htm) on each broker node. After that it is possible to use `helm upgrade` with a secret specified.
+It is also important to note that because the TLS/SSL configuration are not included in the global [backup](https://docs.solace.com/Admin/Restoring-Config-Files.htm), this configuration can not be restored.
 
 #### Rotating the server key
 
@@ -571,6 +599,57 @@ Services require [pod label "active"](#using-pod-label-active-to-identify-the-ac
 
 Using secrets for TLS server keys and certificates follows Kubernetes recommendations, however, particularly in a production environment, additional steps are required to ensure only authorized access to these secrets following Kubernetes industry best practices, including setting tight RBAC permissions and fixing possible security holes.
 
+### User management considerations
+
+#### Adding new users
+
+The deployment comes with an existing user `admin`. Depending on how the installation is carried out, it should start with a random 
+password or an existing one. Refer [here](#admin-password). The default `admin` user has `admin` CLI User Access Level. This means
+an `admin` user can execute all CLI commands on the event broker which also includes controlling broker-wide authentication and authorization. They can also create other admin users. 
+
+However, if there is need to set up a new CLI user, first directly access the event broker pod:
+
+```sh
+kubectl exec -it XXX-XXX-pubsubplus-<pod-ordinal> -- bash
+```
+
+once you have access to the Solace CLI, enter the following commands to create a new user:
+
+```sh
+solace> enable
+solace# configure
+solace(configure)# create username <new-user-name>
+```
+
+enter the following commands to set the CLI User and their access level. For a full list of all the available access levels refer to [this](https://docs.solace.com/Admin/CLI-User-Access-Levels.htm)
+
+```sh
+solace(configure/username) global-access-level <access-level>
+solace(configure/username) change-password <password>
+```
+
+The new user will now be available for use via the CLI  
+
+#### Changing user passwords
+
+At the moment, we do not support changing the default `admin` user password. 
+If there is a need to change the password of a user other than the `admin`. 
+
+Directly access the event broker pod:
+
+```sh
+kubectl exec -it XXX-XXX-pubsubplus-<pod-ordinal> -- bash
+```
+
+get access to the Solace CLI and enter the following commands:
+
+```sh
+solace> enable
+solace# configure
+solace(configure)# username <user-name>
+solace(configure/username) change-password <password>
+```
+
 ## Deployment Prerequisites
 
 ### Platform and tools setup
@@ -594,7 +673,7 @@ Check your platform running the `kubectl get nodes` command from your command-li
 #### Install and setup the Helm package manager
 
 The event broker can be deployed using Helm v3.
-> Note: For Helm v2 support refer to [earlier versions of this quickstart](https://github.com/SolaceProducts/pubsubplus-kubernetes-quickstart/releases).
+> Note: For Helm v2 support refer to [earlier versions of this quickstart](https://github.com/SolaceProducts/pubsubplus-kubernetes-helm-quickstart/releases).
 
 The Helm v3 executable is available from https://github.com/helm/helm/releases . Further documentation is available from https://helm.sh/.
 
@@ -615,7 +694,7 @@ The recommended way is to make use of published pre-packaged PubSub+ charts from
 Add or refresh a local Solace `solacecharts` repo:
 ```bash
 # Add new "solacecharts" repo
-helm repo add solacecharts https://solaceproducts.github.io/pubsubplus-kubernetes-quickstart/helm-charts
+helm repo add solacecharts https://solaceproducts.github.io/pubsubplus-kubernetes-helm-quickstart/helm-charts
 # Refresh if needed, e.g.: to use a recently published chart version
 helm repo update solacecharts
 
@@ -641,7 +720,7 @@ helm fetch solacecharts/pubsubplus --untar
 # Use the Helm chart from this directory
 helm install ./pubsubplus
 ```
-> Note: it is encouraged to raise a [GitHub issue](https://github.com/SolaceProducts/pubsubplus-kubernetes-quickstart/issues/new) to possibly contribute your enhancements back to the project.
+> Note: it is encouraged to raise a [GitHub issue](https://github.com/SolaceProducts/pubsubplus-kubernetes-helm-quickstart/issues/new) to possibly contribute your enhancements back to the project.
 
 ### Alternative Deployment with generating templates for the Kubernetes `kubectl` tool
 
@@ -656,7 +735,7 @@ Note that later sections of this document about modifying, upgrading or deleting
 2) Add or refresh a local Solace `solacecharts` repo:
 ```bash
 # Add new "solacecharts" repo
-helm repo add solacecharts https://solaceproducts.github.io/pubsubplus-kubernetes-quickstart/helm-charts
+helm repo add solacecharts https://solaceproducts.github.io/pubsubplus-kubernetes-helm-quickstart/helm-charts
 # Refresh if needed, e.g.: to use a recently published chart version
 helm repo update solacecharts
 ```
@@ -1028,7 +1107,12 @@ kubectl get statefulsets,services,pods,pvc,pv
 
 > Note: Helm will not clean up PVCs and related PVs. Use `kubectl delete` to delete PVCs is associated data is no longer required.
 
+## Backing Up and Restore
 
+The preferred way of backing up and restoring your deployment is by backing up and restoring the message vpns. 
+This is because of certain limitations of the system-wide backup and restore. For example TLS/SSL configuration are not included in system-wide backup hence configurations related to it will be lost.
+
+A detailed guide to perform backing up and restore of message vpns can be found [here](https://docs.solace.com/Features/VPN/Backing-Up-and-Restoring-VPNs.htm).
 
 
 

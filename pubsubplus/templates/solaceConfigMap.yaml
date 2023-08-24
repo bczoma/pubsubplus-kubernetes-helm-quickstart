@@ -37,10 +37,9 @@ data:
     cat /mnt/disks/certs/server/{{.Values.tls.certFilename | default "tls.key"}} /mnt/disks/certs/server/{{.Values.tls.certKeyFilename | default "tls.crt"}} > /dev/shm/server.cert
     export tls_servercertificate_filepath="/dev/shm/server.cert"
 {{- end }}
+    # Deal with the fact we cannot accept "-" in router names
+    export routername=$(echo $(hostname) | sed 's/-//g')
 {{- if .Values.solace.redundancy }}
-    # [TODO] KBARR not using correct method of finding ordinal until we bump min Kubernetes release above 1.8.1
-    # https://github.com/kubernetes/kubernetes/issues/40651
-    # node_ordinal=$(STATEFULSET_ORDINAL)
     IFS='-' read -ra host_array <<< $(hostname)
     node_ordinal=${host_array[-1]}
     if [[ ! -z `echo $STATEFULSET_NAMESPACE` ]]; then
@@ -49,9 +48,7 @@ data:
       namespace=default
     fi
     service={{ template "solace.fullname" . }}
-    # Deal with the fact we cannot accept "-" in routre names
     service_name=$(echo ${service} | sed 's/-//g')
-    export routername=$(echo $(hostname) | sed 's/-//g')
     export redundancy_enable=yes
     export configsync_enable=yes
     export redundancy_authentication_presharedkey_key=`cat /mnt/disks/secrets/username_admin_password | awk '{x=$0;for(i=length;i<51;i++)x=x "0";}END{print x}' | base64` # Right-pad with 0s to 50 length
@@ -88,9 +85,11 @@ data:
     echo "`date` INFO: ${APP}-Node ordinal: ${node_ordinal}"
     echo "`date` INFO: ${APP}-Waiting for management API to become available"
     password=`cat /mnt/disks/secrets/username_admin_password`
+    INITIAL_STARTUP_FILE=/var/lib/solace/var/k8s_initial_startup_marker
     loop_guard=60
     pause=10
     count=0
+    # Wait for Solace Management API
     while [ ${count} -lt ${loop_guard} ]; do 
       if /mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 -t ; then
         break
@@ -116,11 +115,21 @@ data:
     echo "`date` INFO: ${APP}-Server certificate has been configured"
 {{- end }}
 {{- if .Values.solace.redundancy }}
+    # Function to get remote sync state
+    get_router_remote_config_state() {
+      # Params: $1 is property of config to return for router
+      routerresults=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync><database/><router/><remote/></config-sync></show></rpc>" \
+                -v "/rpc-reply/rpc/show/config-sync/database/remote/tables/table[1]/source-router/${1}"`
+      routerremotesync_result=`echo ${routerresults} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+      echo $routerremotesync_result
+    }
     # for non-monitor nodes setup redundancy and config-sync
     if [ "${node_ordinal}" != "2" ]; then
-      resync_step=""
+      resync_step_required=""
       role=""
       count=0
+      # Determine node's primary or backup role
       while [ ${count} -lt ${loop_guard} ]; do 
         role_results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
               -q "<rpc><show><redundancy><detail/></redundancy></show></rpc>" \
@@ -137,16 +146,16 @@ data:
           ;;
         esac
         ((count++))
-        echo "`date` INFO: ${APP}-Waited ${run_time} seconds, got ${role_results} for this node's active-standby role"
+        echo "`date` INFO: ${APP}-Waited ${run_time} seconds, got ${role_results} for this node's primary or backup role"
         sleep ${pause}
       done
       if [ ${count} -eq ${loop_guard} ]; then
-        echo "`date` ERROR: ${APP}-Could not determine this node's active-standby role"  >&2
+        echo "`date` ERROR: ${APP}-Could not determine this node's primary or backup role"  >&2
         exit 1 
       fi
-      # Determine local activity
+      echo "`date` INFO: ${APP}-Management API is up, determined that this node's role is: ${role}"
+      # Determine activity (local or mate active)
       count=0
-      echo "`date` INFO: ${APP}-Management API is up, determined that this node's active-standby role is: ${role}"
       while [ ${count} -lt ${loop_guard} ]; do 
         online_results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
             -q "<rpc><show><redundancy><detail/></redundancy></show></rpc>" \
@@ -156,29 +165,32 @@ data:
         case "${local_activity}" in
           "Local Active")
             echo "`date` INFO: ${APP}-Node activity status is Local Active, after ${run_time} seconds"
-            # We should only be here on new cluster create, if not likely a bug
-            # Need to issue assert master to get back into sync"
-            resync_step="assert-master"
+            # We should only be here on new cluster create, if not this is an indication of unexpected HA procedures
+            if [[ ! -e ${INITIAL_STARTUP_FILE} ]]; then
+                # Need to issue assert leader to get back into sync only one time when the PubSub+ Event Broker starts the first time
+                echo "`date` INFO: ${APP}-Broker initial startup detected. This node will assert config-sync configuration over its mate"
+                resync_step_required="true"
+            else
+                echo "`date` WARN: ${APP}-Unexpected state: this is not an initial startup of the broker and this node reports Local Active. Possibly a redeploy?"
+            fi
             break
             ;;
           "Mate Active")
             echo "`date` INFO: ${APP}-Node activity status is Mate Active, after ${run_time} seconds"
-            # This is normal state if we are backup or recreated later on
-            # will issue a resync master to get back into sync
-            resync_step="resync-master"
             break
             ;;
         esac
         ((count++))
-        echo "`date` INFO: ${APP}-Waited ${run_time} seconds, Local activity state is: ${local_activity}"
+        echo "`date` INFO: ${APP}-Waited ${run_time} seconds, node activity state is: ${local_activity}"
         sleep ${pause}
       done
       if [ ${count} -eq ${loop_guard} ]; then
-        echo "`date` ERROR: ${APP}-Local activity state never become Local Active or Mate Active"  >&2
+        echo "`date` ERROR: ${APP}-Node activity state never become Local Active or Mate Active"  >&2
         exit 1 
       fi
-      # If we need to assert master, then we need to wait for mate to reconcile
-      if [ "${resync_step}" = "assert-master" ]; then
+      # If we need to assert leader, then first wait for mate to report Standby state
+      if [ "${resync_step_required}" = "true" ]; then
+        # This branch is AD-active only
         count=0
         echo "`date` INFO: ${APP}-Waiting for mate activity state to be 'Standby'"
         while [ ${count} -lt ${loop_guard} ]; do 
@@ -201,8 +213,8 @@ data:
           echo "`date` ERROR: ${APP}-Mate not in sync, never reached Standby" >&2
           exit 1 
         fi
-      fi # if assert-master
-      # Ensure Config-sync connection state is Connected before proceeding
+      fi # if assert-leader
+      # Ensure Config-sync connection state is Connected for both primary and backup before proceeding
       count=0
       echo "`date` INFO: ${APP}-Waiting for config-sync connected"
       while [ ${count} -lt ${loop_guard} ]; do
@@ -225,15 +237,18 @@ data:
         echo "`date` ERROR: ${APP}-Config-sync connection state never reached Connected" >&2
         exit 1
       fi
-      # Now can issue {resync_step} command
-      echo "`date` INFO: ${APP}-Initiating ${resync_step}"
-      /mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
-            -q "<rpc semp-version=\"soltr/9_8VMR\"><admin><config-sync><${resync_step}><router/></${resync_step}></config-sync></admin></rpc>"
-      /mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
-            -q "<rpc semp-version=\"soltr/9_8VMR\"><admin><config-sync><${resync_step}><vpn-name>*</vpn-name></${resync_step}></config-sync></admin></rpc>"
+      # Now can issue assert-leader command
+      if [ "${resync_step_required}" = "true" ]; then
+        # This branch is AD-active only
+        echo "`date` INFO: ${APP}-Initiating assert-leader"
+        /mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+              -q "<rpc><admin><config-sync><assert-leader><router/></assert-leader></config-sync></admin></rpc>"
+        /mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+              -q "<rpc><admin><config-sync><assert-leader><vpn-name>*</vpn-name></assert-leader></config-sync></admin></rpc>"
+      fi
       # Wait for config-sync results
       count=0
-      echo "`date` INFO: ${APP}-Waiting for config-sync connected"
+      echo "`date` INFO: ${APP}-Waiting for config-sync results"
       while [ ${count} -lt ${loop_guard} ]; do
         online_results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
                 -q "<rpc><show><config-sync></config-sync></show></rpc>" \
@@ -248,7 +263,44 @@ data:
         esac
         ((count++))
         echo "`date` INFO: ${APP}-Waited ${run_time} seconds, Config-sync is: ${confsyncstatus_results}, not yet Up"
-        sleep ${pause}
+
+        # Additional checks to confirm config-sync (even if reported gloabally as not Up, it may be still up between local primary and backup in a DR setup)
+        echo "`date` INFO: ${APP}-Checking Config-sync Setup. Starting additional checks to confirm config-sync locally..."
+        messagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+              -q "<rpc><show><config-sync><database/><detail/></config-sync></show></rpc>" \
+              -v "count(/rpc-reply/rpc/show/config-sync/database/local/tables/table)"`
+        messagevpn_total=`echo ${messagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+
+        # Count message_vpns in-sync and compare with total
+        localmessagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+              -q "<rpc><show><config-sync><database/></config-sync></show></rpc>" \
+              -v "count(//table[sync-state='In-Sync'])"`
+        local_messagevpn_total_insync=`echo ${localmessagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+        if [ "$messagevpn_total" -ne "$local_messagevpn_total_insync" ]; then
+          echo "`date` INFO: ${APP}-Config-sync state is not in-sync locally."
+          sleep ${pause}
+          continue
+        fi
+
+        echo "`date` INFO: ${APP}-Checking Config-sync Setup. Remote config-sync state check starting..."
+        vpnremotehamate_result=$(get_router_remote_config_state "name")
+
+        remote_messagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+              -q "<rpc><show><config-sync><database/><remote/></config-sync></show></rpc>" \
+              -v "count(//table/source-router[name='$vpnremotehamate_result'])"`
+        remote_messagevpn_total=`echo ${remote_messagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+
+        #Count message_vpns in-sync, not stale and compare with total
+        remotemessagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+              -q "<rpc><show><config-sync><database/><remote/></config-sync></show></rpc>" \
+              -v "count(//table/source-router[name='$vpnremotehamate_result' and sync-state='In-Sync' and stale='No'])"`
+        remote_messagevpn_total_insync=`echo ${remotemessagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+        if [ "$remote_messagevpn_total" -ne "$remote_messagevpn_total_insync" ]; then
+          echo "`date` INFO: ${APP}-Config-sync state is not in-sync for remote."
+          sleep ${pause}
+          continue
+        fi
+        break
       done
       if [ ${count} -eq ${loop_guard} ]; then
         echo "`date` ERROR: ${APP}-Config-sync never reached state \"Up\"" >&2
@@ -257,6 +309,10 @@ data:
     fi # if not monitor
 {{- end }}
     echo "`date` INFO: ${APP}-PubSub+ Event Broker bringup is complete for this node."
+    # create startup file after PubSub+ Event Broker is up and running.  Create only if it does not exist
+    if [[ ! -e ${INITIAL_STARTUP_FILE} ]]; then
+        echo "PubSub+ Event Broker initial startup completed on `date`" > ${INITIAL_STARTUP_FILE}
+    fi
     exit 0
 
 
@@ -264,7 +320,9 @@ data:
     #!/bin/bash
     APP=`basename "$0"`
     LOG_FILE=/usr/sw/var/k8s_readiness_check.log # STDOUT/STDERR goes to k8s event logs but gets cleaned out eventually. This will also persist it.
-    tail -n 1000 ${LOG_FILE} > ${LOG_FILE}.tmp; mv -f ${LOG_FILE}.tmp ${LOG_FILE} || :  # Limit logs size
+    if [ -f ${LOG_FILE} ] ; then
+        tail -n 1000 ${LOG_FILE} > ${LOG_FILE}.tmp; mv -f ${LOG_FILE}.tmp ${LOG_FILE} || :  # Limit logs size
+    fi
     exec > >(tee -a ${LOG_FILE}) 2>&1 # Setup logging
     FINAL_ACTIVITY_LOGGED_TRACKING_FILE=/tmp/final_activity_state_logged
 
@@ -304,63 +362,43 @@ data:
       fi
     }
 
+
+    # Function to get remote sync state
+    get_router_remote_config_state() {
+      # Params: $1 is property of config to return for router
+      routerresults=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync><database/><router/><remote/></config-sync></show></rpc>" \
+                -v "/rpc-reply/rpc/show/config-sync/database/remote/tables/table[1]/source-router/${1}"`
+      routerremotesync_result=`echo ${routerresults} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+      echo $routerremotesync_result
+    }
+
     # Main logic: note that there are no re-tries here, if check fails then return not ready.
 {{- if .Values.solace.redundancy }}
     # HA config
     IFS='-' read -ra host_array <<< $(hostname)
     node_ordinal=${host_array[-1]}
     password=`cat /mnt/disks/secrets/username_admin_password`
-
-    # For update (includes SolOS upgrade) purposes, additional checks are required for readiness state when the pod has been started
-    # This is an update if the LASTVERSION_FILE with K8s controller-revision-hash exists and contents differ from current value
-    LASTVERSION_FILE=/var/lib/solace/var/lastConfigRevisionBeforeReboot
-    if [ -f ${LASTVERSION_FILE} ] && [[ $(cat ${LASTVERSION_FILE}) != $(get_label "controller-revision-hash") ]] ; then
-      echo "`date` INFO: ${APP}-Upgrade detected, running additional checks..."
+    # For monitor node just check for redundancy; active label will never be set
+    if [ "${node_ordinal}" = "2" ]; then
       # Check redundancy
       results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
               -q "<rpc><show><redundancy/></show></rpc>" \
               -v "/rpc-reply/rpc/show/redundancy/redundancy-status"`
       redundancystatus_results=`echo ${results} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
       if [ "${redundancystatus_results}" != "Up" ]; then
-        echo "`date` INFO: ${APP}-Redundancy state is not yet up."
+        echo "`date` INFO: ${APP}-Waiting for redundancy up, redundancy state is not yet up."
         rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
       fi
-      # Additionally check config-sync status for non-monitoring nodes
-      if [ "${node_ordinal}" != "2" ]; then
-        results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
-                -q "<rpc><show><config-sync></config-sync></show></rpc>" \
-                -v "/rpc-reply/rpc/show/config-sync/status/oper-status"`
-        confsyncstatus_results=`echo ${results} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
-        if [ "${confsyncstatus_results}" != "Up" ]; then
-          echo "`date` INFO: ${APP}-Config-sync state is not yet up."
-          rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
-        fi
+      if [ ! -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE} ]; then
+        echo "`date` INFO: ${APP}-All nodes online, monitor node is redundancy ready"
+        touch ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}
+        echo "`date` INFO: ${APP}-Server status check complete for this broker node"
+        exit 1
       fi
-    fi
-    # Record current version in LASTVERSION_FILE
-    echo $(get_label "controller-revision-hash") > ${LASTVERSION_FILE}
-    # For monitor node just check for 3 online nodes in group; active label will never be set
-    if [ "${node_ordinal}" = "2" ]; then
-      role_results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
-              -q "<rpc><show><redundancy><group/></redundancy></show></rpc>" \
-              -c "/rpc-reply/rpc/show/redundancy/group-node/status[text() = \"Online\"]"`
-      if [[ ${role_results} != *"<errorInfo></errorInfo>"* ]]; then
-        errorinfo=`echo ${results} | xmllint -xpath "string(returnInfo/errorInfo)" - 2>/dev/null` || errorinfo=
-        echo "`date` INFO: ${APP}-Waiting for valid server status response, got ${errorinfo}"
-        rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
-      fi
-      nodes_online=`echo ${role_results} |  xmllint -xpath "string(returnInfo/countSearchResult)" -`
-      if [ "$nodes_online" -eq "3" ]; then
-        if [ ! -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE} ]; then
-          echo "`date` INFO: ${APP}-All nodes online, monitor node is redundancy ready"
-          touch ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}
-        fi
-        exit 0
-      else
-        echo "`date` INFO: ${APP}-Monitor node is not redundancy ready, ${nodes_online} of 3 nodes online"
-        rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
-      fi
+      exit 0
     fi # End Monitor Node
+    # From here only message routing nodes.
     # For Primary or Backup nodes set both service readiness (active label) and k8s readiness (exit return value)
     health_result=`curl -s -o /dev/null -w "%{http_code}"  http://localhost:5550/health-check/guaranteed-active`
     case "${health_result}" in
@@ -368,6 +406,9 @@ data:
         if [ ! -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE} ]; then
           echo "`date` INFO: ${APP}-HA Event Broker health check reported 200, message spool is up"
           touch ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}
+          echo "`date` INFO: ${APP}-Server status check complete for this broker node"
+          echo "`date` INFO: ${APP}-Changing pod label to active"
+          #exit 1 Removing as this may delay activity switch by 5 seconds
         fi
         set_label "active" "true"
         exit 0
@@ -380,6 +421,7 @@ data:
       *)
         echo "`date` WARN: ${APP}-HA Event Broker health check reported unexpected ${health_result}"
         set_label "active" "false"
+        echo "`date` INFO: ${APP}-Changing pod label to inactive"
         rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
     esac
     # At this point analyzing readiness after health check returned 503 - checking if Event Broker is Standby
@@ -397,10 +439,64 @@ data:
     local_activity=`echo ${online_results} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
     case "${local_activity}" in
       "Mate Active")
+        # Check redundancy
+        results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><redundancy/></show></rpc>" \
+                -v "/rpc-reply/rpc/show/redundancy/redundancy-status"`
+        redundancystatus_results=`echo ${results} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+        if [ "${redundancystatus_results}" != "Up" ]; then
+          echo "`date` INFO: ${APP}-Running checks.Redundancy state is not yet up."
+          rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
+        fi
+        # Check config-sync status
+        results=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync></config-sync></show></rpc>" \
+                -v "/rpc-reply/rpc/show/config-sync/status/oper-status"`
+        confsyncstatus_results=`echo ${results} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+        if [ "${confsyncstatus_results}" != "Up" ]; then
+
+          # Additional check to confirm config-sync
+          echo "`date` INFO: ${APP}-Checking Config-sync Setup. Starting additional checks to confirm config-sync locally..."
+
+          messagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync><database/><detail/></config-sync></show></rpc>" \
+                -v "count(/rpc-reply/rpc/show/config-sync/database/local/tables/table)"`
+          messagevpn_total=`echo ${messagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+
+          # Count message_vpns in-sync and compare with total
+          localmessagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync><database/></config-sync></show></rpc>" \
+                -v "count(//table[sync-state='In-Sync'])"`
+          local_messagevpn_total_insync=`echo ${localmessagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+          if [ "$messagevpn_total" -ne "$local_messagevpn_total_insync" ]; then
+            echo "`date` INFO: ${APP}-Config-sync state is not in-sync locally."
+            rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
+          fi
+
+          echo "`date` INFO: ${APP}-Checking Config-sync Setup. Remote config-sync state check starting..."
+          vpnremotehamate_result=$(get_router_remote_config_state "name")
+
+          remote_messagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync><database/><remote/></config-sync></show></rpc>" \
+                -v "count(//table/source-router[name='$vpnremotehamate_result'])"`
+          remote_messagevpn_total=`echo ${remote_messagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+
+          #Count message_vpns in-sync, not stale and compare with total
+          remotemessagevpn_result=`/mnt/disks/solace/semp_query.sh -n admin -p ${password} -u http://localhost:8080 \
+                -q "<rpc><show><config-sync><database/><remote/></config-sync></show></rpc>" \
+                -v "count(//table/source-router[name='$vpnremotehamate_result' and sync-state='In-Sync' and stale='No'])"`
+          remote_messagevpn_total_insync=`echo ${remotemessagevpn_result} | xmllint -xpath "string(returnInfo/valueSearchResult)" -`
+          if [ "$remote_messagevpn_total" -ne "$remote_messagevpn_total_insync" ]; then
+            echo "`date` INFO: ${APP}-Config-sync state is not in-sync for remote."
+            rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
+          fi
+        fi
         # Pass readiness check
         if [ ! -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE} ]; then
-          echo "`date` INFO: ${APP}-Redundancy is up and node is mate Active"
+          echo "`date` INFO: ${APP}-Redundancy is up and node is Mate Active"
           touch ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}
+          echo "`date` INFO: ${APP}-Server status check complete for this broker node"
+          exit 1
         fi
         exit 0
         ;;
@@ -417,6 +513,9 @@ data:
         if [ ! -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE} ]; then
           echo "`date` INFO: ${APP}-nonHA Event Broker health check reported 200, message spool is up"
           touch ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}
+          echo "`date` INFO: ${APP}-Server status check complete for this broker node"
+          echo "`date` INFO: ${APP}-Changing pod label to active"
+          exit 1
         fi
         set_label "active" "true"
         exit 0
@@ -424,12 +523,14 @@ data:
       "503")
         if [[ $(get_label "active") = "true" ]]; then echo "`date` INFO: ${APP}-nonHA Event Broker health check reported 503, message spool is down"; fi
         set_label "active" "false"
+        echo "`date` INFO: ${APP}-Changing pod label to inactive"
         # Fail readiness check
         rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
         ;;
       *)
         echo "`date` WARN: ${APP}-nonHA Event Broker health check reported ${health_result}"
         set_label "active" "false"
+        echo "`date` INFO: ${APP}-Changing pod label to inactive"
         # Fail readiness check
         rm -f ${FINAL_ACTIVITY_LOGGED_TRACKING_FILE}; exit 1
     esac
@@ -476,7 +577,7 @@ data:
         echo  '<returnInfo><errorInfo>missing parameter</errorInfo></returnInfo>'
         exit 1
       fi
-      if [ "`curl --write-out '%{http_code}' --silent --output /dev/null -u ${username}:${password} ${url}/SEMP`" != "200" ] ; then
+      if [ "`curl --write-out '%{http_code}' --silent --output /dev/null -u ${username}:${password} ${url}/SEMP -d '<rpc><show><version/></show></rpc>'`" != "200" ] ; then
         echo  "<returnInfo><errorInfo>management host is not responding</errorInfo></returnInfo>"
         exit 1
       fi
@@ -485,7 +586,7 @@ data:
       fi
       query_response=`curl -sS -u ${username}:${password} ${url}/SEMP -d "${query}"`
       # Validate first char of response is "<", otherwise no hope of being valid xml
-      if [[ ${query_response:0:1} != "<" ]] ; then 
+      if [[ ${query_response:0:1} != "<" ]] ; then
         echo  "<returnInfo><errorInfo>no valid xml returned</errorInfo></returnInfo>"
         exit 1
       fi
